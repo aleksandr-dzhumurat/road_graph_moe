@@ -1,0 +1,35 @@
+cloakbrowser
+fastapi
+uvicorn[standard]
+python-multipart
+torch
+torchvision
+timm
+opencv-python-headless
+streamlit
+requests
+numpy
+pillow
+pydantic
+onnxruntime
+ucimlrepo
+kaggle
+tqdm
+h3
+pyarrow
+pandas
+google-cloud-bigquery
+google-cloud-bigquery-storage
+db-dtypes
+folium
+matplotlib
+contextily
+# Phase 2 dependencies: OpenStreetMap integration
+osmnx>=1.6.0
+geopandas>=0.14.0
+shapely>=2.0.0
+networkx>=3.0
+scipy>=1.7.0
+# Graph neural networks - PyTorch Geometric (Python 3.13 compatible)
+torch-geometric>=2.4.0
+# Alternative to DGL - better Python 3.13 support and more active development

@@ -1,0 +1,17 @@
+data
+.claude
+.vscode
+.idea
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+*.db
+*.sqlite3
+*.log
+docs
+.env
+**/__pycache__
+**/*.pyc
+.venv
+.history/
