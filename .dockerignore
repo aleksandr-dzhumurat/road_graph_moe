@@ -1,0 +1,12 @@
+data
+.claude
+docs
+.env
+.git
+.gitignore
+README.md
+Makefile
+requirements.txt
+**/__pycache__
+**/*.pyc
+.venv

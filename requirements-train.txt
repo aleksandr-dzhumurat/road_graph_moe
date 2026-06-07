@@ -1,0 +1,19 @@
+# Hard dependencies — training container cannot start without these
+matplotlib
+pyarrow
+pandas
+h3
+tqdm
+requests
+
+# Phase 2: PyTorch Geometric — enables GAT road-adapter
+# Installed separately in Dockerfile to pin the right CUDA wheel
+# torch-geometric is listed here only as documentation; the Dockerfile handles it
+
+# Phase 2: OSM integration (optional — code falls back to mock road graphs if absent)
+# Commented out because geopandas requires system GDAL and bloats the image.
+# Install on a dev machine with: pip install osmnx geopandas shapely networkx
+# osmnx>=1.6.0
+# geopandas>=0.14.0
+# shapely>=2.0.0
+# networkx>=3.0

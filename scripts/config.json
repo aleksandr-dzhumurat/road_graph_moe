@@ -1,0 +1,28 @@
+{
+  "pipeline": {
+    "default_stage": "gold",
+    "default_region": "all",
+    "default_shards": 8
+  },
+  "tokenizer": {
+    "h3_resolution": 9,
+    "subhash_vocab_size": 30000,
+    "vocab_size": 30004,
+    "max_seq_len": 512,
+    "n_dt_buckets": 64,
+    "d_model": 768,
+    "n_layers": 12,
+    "n_heads": 12
+  },
+  "filtering": {
+    "max_speed_kmh": 200.0,
+    "trip_gap_seconds": 1800,
+    "min_trip_points": 10
+  },
+  "porto": {
+    "dt_seconds": 15.0
+  },
+  "tdrive": {
+    "timestamp_format": "%Y-%m-%d %H:%M:%S"
+  }
+}
