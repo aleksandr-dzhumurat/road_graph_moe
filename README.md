@@ -5,11 +5,22 @@ two-headed self-supervised objective: **Masked Trajectory Modeling (MTM)** for r
 quality and **Autoregressive (AR) next-location prediction** for anomaly scoring.
 Trained end-to-end on **Nebius Serverless AI Jobs** — Phase 1 on a preemptible H100-SXM, Phase 2 on a 2×L40S node for parallel expert training.
 
-The map below shows model inference on a real Porto route (Boavista → Praça da Liberdade).
-Each hexagon is an H3 cell at resolution 9 (~0.1 km²). Given the first 8 cells, the AR head
-predicts the next most-likely cell; the MTM head reconstructs a masked position from context.
+**Model on Hugging Face:** [aleksandr-dzhumurat/geospatial-trajectory-transformer](https://huggingface.co/aleksandr-dzhumurat/geospatial-trajectory-transformer)
 
-![Inference — Porto trajectory](docs/img/inference_trajectory.png)
+
+---
+
+## Why Nebius Serverless
+
+This project uses [Nebius Serverless AI Jobs](https://nebius.com/services/serverless-gpu) throughout.
+
+- **Remote image builds** — submits the Docker build as a Nebius job on a remote VM with the correct linux/amd64 arch, then pushes directly to the Nebius Container Registry. No local daemon, no cross-compilation, no slow layer uploads.
+
+- **S3-mounted code — deploy without rebuilding** — scripts are mounted into the container from S3. A code change is live after a single sync command; no heavy Docker image rebuild needed.
+
+- **S3 for all artifacts** — checkpoints are written to a read-write S3 mount and survive job restarts. Logs are fetched via the Nebius CLI — no SSH required.
+
+- **Preemptible instances** — both training jobs use `--preemptible` to cut GPU-hour cost (~$28 vs ~$84 on-demand for Phase 1). A `SIGTERM` handler in the training loop saves a checkpoint on eviction so the next run resumes cleanly.
 
 ---
 
@@ -26,19 +37,46 @@ to a shared Transformer trunk. Two heads are trained jointly:
 After pretraining, the AR head gives a calibrated perplexity score for any trajectory —
 detours, unusual routes, and driver fraud surface as high-perplexity sequences.
 
+
+The map below shows model inference on a real Porto route (Boavista → Praça da Liberdade).
+Each hexagon is an H3 cell at resolution 9 (~0.1 km²). Given the first 8 cells, the AR head
+predicts the next most-likely cell; the MTM head reconstructs a masked position from context.
+
+![Inference — Porto trajectory](docs/img/inference_trajectory.png)
+
+
 ---
 
 ## Architecture
 
-- **Backbone:** 12-layer Transformer, d_model=768, 12 heads, Flash Attention (`is_causal=True`)
+**Phase 1 — Backbone** (`backbone.py`)
+
+- **Model:** 12-layer Transformer, d_model=768, 12 heads, Flash Attention (`is_causal=True`)
 - **Embedding:** spatial H3 token + dt_bucket (log-spaced Δt) + minute-of-day + day-of-week
 - **Vocab:** 30,004 tokens (30,000 spatial sub-hash buckets + PAD/BOS/EOS/MASK)
 - **Max sequence:** 512 tokens
 - **Parameters:** 132.8 M
 - **Weight tying:** MTM head and AR head share the same projection matrix
 
-The H3 sub-hash maps any geographic cell to the same vocab regardless of city — keeping the
-embedding table fixed-size and enabling cross-city pretraining without per-city vocabularies.
+The H3 sub-hash maps any geographic cell to the same vocab regardless of city — keeping the embedding table fixed-size and enabling cross-city pretraining without per-city vocabularies.
+
+**Phase 2 — Geographic Experts** (`experts.py`)
+
+City-specific adapters that sit on top of the frozen backbone and refine its hidden states using road graph structure, producing predictions in the same H3 token space:
+
+```
+input tokens
+  → backbone.trunk()        # frozen Phase 1 weights, city-agnostic
+  → h  [B, L, 768]
+  → GeographicExpert (GAT)  # city-specific, trainable
+  → fused_h  [B, L, 768]    # road context fused in
+  → tok_head @ tok_emb.T    # weight-tied to backbone embedding
+  → logits  [vocab_size]    # same output space as backbone
+```
+
+- **GeographicExpert:** Graph Attention Network over the city's OSM road graph; fuses road entity features (roundabouts, signals, motorways, bridges) into backbone hidden states
+- **GeographicRouter:** top-1 routing with geographic prior — selects Porto or Beijing expert per trajectory
+- **Weight tying:** expert `tok_head` shares the backbone's token embedding matrix — same vocab, no extra parameters for the output projection
 
 ---
 
@@ -212,6 +250,7 @@ make upload-road-gold
 
 ```bash
 make build-remote       # build Docker image on Nebius VM and push to registry
+make upload-code        # sync scripts/ → s3://geo-trajectories-code/ (deploy without rebuild)
 make create-s3-secret   # store S3 credentials as a Nebius secret
 make run-cloud          # submit a preemptible H100-SXM job (~$28, ~12h 43m)
 ```
@@ -244,21 +283,31 @@ uv run python scripts/train_curve.py data/train_log_full.txt
 ```
 
 
-### Download the final checkpoint
+### Download checkpoints
 
 ```bash
-make download-ckpt  # fetches ckpt_final.pt from s3://geo-trajectories-checkpoints/
+make download-ckpts  # fetches ckpt_final.pt + latest expert_porto_*.pt + latest expert_beijing_*.pt
 ```
 
+`make download-ckpt` (singular) fetches only the backbone `ckpt_final.pt` if you don't need the experts.
+
 ### Run inference on a sample Porto trajectory
+
+**Backbone only** (AR next-token + MTM masked reconstruction):
 
 ```bash
 make inference
 ```
 
-Runs both the AR head (next-token prediction) and MTM head (masked-token reconstruction) on
-a 8-waypoint Porto route (Boavista → Praça da Liberdade) and saves a map visualization to
-`data/inference_trajectory.png`.
+Saves a map visualization to `data/inference_trajectory.png`.
+
+**With geographic expert** (backbone + GAT road-context fusion):
+
+```bash
+python scripts/experts.py --infer --expert porto
+```
+
+Prints geographic routing probabilities and top-5 AR next-token predictions from the expert-fused head.
 
 ---
 
@@ -295,11 +344,10 @@ Dockerfile
 | Phase | Status | Description |
 |---|---|---|
 | 1 — Backbone pretraining | **Done** | Two-headed Transformer on Porto + Beijing; AR perplexity 34,754 → 2.1 |
-| 2 — Geographic experts | **Training** | Per-city GAT adapters over OSM road graphs; Porto done (ar_loss 0.61), Beijing in progress |
-| 3 — Anomaly head | Planned | SD-conditioned perplexity scorer; PR-AUC vs. GM-VSAE baseline |
-| 4 — Serving | Planned | Batch scoring endpoint; trips-per-dollar benchmark |
-
-**Phase 2 details**: Each city gets a `GeographicExpert` — a Graph Attention Network over the city's OpenStreetMap road graph — that fuses road context (roundabouts, signals, motorways, bridges) into the frozen backbone's hidden states. The road graphs are built by `etl.py --stage road-gold` and validated by `--stage check-road-gold` before upload. Training runs on 2 GPUs simultaneously via `torchrun`; a single GPU cannot hold both experts at wall-clock parity due to Beijing's 163k-node road graph.
+| 2 — Geographic experts | **Done** | Per-city GAT adapters over OSM road graphs; Porto (ar_loss 0.61) and Beijing trained on 2×L40S via torchrun |
+| 3 — New city road graphs | Planned | Add experts for new cities (e.g. London, NYC) by running `etl.py --stage road-gold` on any OSM region and training a new `GeographicExpert` without retraining the backbone |
+| 4 — Anomaly head | Planned | Perplexity scorer with threshold calibration; PR-AUC vs. GM-VSAE baseline |
+| 5 — Serving | Planned | Batch scoring endpoint; trips-per-dollar benchmark |
 
 ---
 

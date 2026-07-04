@@ -7,7 +7,7 @@ NEBIUS       ?= $(HOME)/.nebius/bin/nebius
 
 
 
-build:
+build-local:
 	docker build --platform linux/amd64 -t $(FULL_IMAGE) .
 
 push:
@@ -65,9 +65,32 @@ inference:
 	python scripts/backbone.py --infer
 
 download-ckpt:
-	aws s3 cp s3://geo-trajectories-checkpoints/ckpt_final.pt data/checkpoints/ckpt_final.pt \
-	  --profile nebius \
-	  --endpoint-url $(S3_ENDPOINT_URL)
+	@mkdir -p data/checkpoints
+	@if [ -f data/checkpoints/ckpt_final.pt ]; then \
+	  echo "ckpt_final.pt already exists, skipping."; \
+	else \
+	  aws s3 cp s3://geo-trajectories-checkpoints/ckpt_final.pt data/checkpoints/ckpt_final.pt \
+	    --profile nebius \
+	    --endpoint-url $(S3_ENDPOINT_URL); \
+	fi
+
+download-ckpts: download-ckpt
+	@mkdir -p data/checkpoints
+	@for expert in porto beijing; do \
+	  latest=$$(aws s3 ls s3://geo-trajectories-checkpoints/ \
+	    --profile nebius --endpoint-url $(S3_ENDPOINT_URL) \
+	    | grep "expert_$${expert}_step_" | sort | tail -1 | awk '{print $$4}'); \
+	  if [ -z "$$latest" ]; then \
+	    echo "No checkpoint found for expert $${expert}, skipping."; \
+	  elif [ -f "data/checkpoints/$$latest" ]; then \
+	    echo "$$latest already exists, skipping."; \
+	  else \
+	    echo "Downloading expert $${expert}: $$latest"; \
+	    aws s3 cp "s3://geo-trajectories-checkpoints/$$latest" "data/checkpoints/$$latest" \
+	      --profile nebius --endpoint-url $(S3_ENDPOINT_URL); \
+	  fi; \
+	done
+
 
 ruff:
 	ruff check src/ --fix

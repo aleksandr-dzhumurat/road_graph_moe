@@ -33,3 +33,4 @@ scipy>=1.7.0
 # Graph neural networks - PyTorch Geometric (Python 3.13 compatible)
 torch-geometric>=2.4.0
 # Alternative to DGL - better Python 3.13 support and more active development
+huggingface_hub

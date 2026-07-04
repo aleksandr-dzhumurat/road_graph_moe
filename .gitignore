@@ -9,7 +9,6 @@ __pycache__
 *.db
 *.sqlite3
 *.log
-docs
 .env
 **/__pycache__
 **/*.pyc

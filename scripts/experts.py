@@ -25,7 +25,7 @@ Usage:
     python scripts/experts.py --expert porto --use-osm --workers 4
     
     # Multi-tenant training across experts
-    python scripts/experts.py --multi-tenant --total-workers 8 --use-osm
+    python scripts/experts.py --multi-tenant --use-osm
     
     # Debug mode
     python scripts/experts.py --debug --expert porto --use-osm
@@ -35,15 +35,15 @@ Dependencies for OSM integration:
 """
 
 import argparse
-import json
 import logging
+import os
 import signal
+import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn as nn
@@ -56,7 +56,7 @@ try:
     import torch_geometric
     from torch_geometric.data import Data
     from torch_geometric.nn import GATConv
-    from torch_geometric.utils import add_self_loops, subgraph
+    from torch_geometric.utils import add_self_loops
     TORCH_GEOMETRIC_AVAILABLE = True
 except ImportError:
     print("Warning: PyTorch Geometric not available. Road graph functionality disabled.")
@@ -67,17 +67,9 @@ except ImportError:
 try:
     import osmnx as ox
     import networkx as nx
-    import geopandas as gpd
-    from shapely.geometry import Point, LineString
     OSM_AVAILABLE = True
 except ImportError:
     OSM_AVAILABLE = False
-
-try:
-    import requests
-    REQUESTS_AVAILABLE = True
-except ImportError:
-    REQUESTS_AVAILABLE = False
 
 # Import from existing scripts
 from backbone import TrajectoryBackbone, TrajectoryDataset, collate_fn, load_config, ts
@@ -923,6 +915,209 @@ def save_expert_checkpoint(expert: nn.Module, router: nn.Module, optimizer: torc
     logging.info(f"[{ts()}] Saved checkpoint to {checkpoint_path}")
 
 # ========================================================================================
+# Inference
+# ========================================================================================
+
+S3_CHECKPOINTS_BUCKET = "s3://geo-trajectories-checkpoints"
+
+
+def _s3_cmd_base() -> list:
+    """Build base aws s3 command with Nebius profile and endpoint."""
+    cmd = ["aws", "s3", "--profile", "nebius"]
+    endpoint = os.environ.get("S3_ENDPOINT_URL", "")
+    if endpoint:
+        cmd += ["--endpoint-url", endpoint]
+    return cmd
+
+
+def _ensure_local(local_path: Path, s3_uri: str) -> None:
+    """Download a single file from S3 if it does not exist locally."""
+    if local_path.exists():
+        return
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+    print(f"{ts()} [s3] Downloading {s3_uri} → {local_path} ...")
+    subprocess.run(_s3_cmd_base() + ["cp", s3_uri, str(local_path)], check=True)
+
+
+def _ensure_expert_ckpts(expert_name: str, ckpt_dir: Path) -> None:
+    """Sync expert_<name>_step_*.pt from S3 if none exist locally."""
+    if list(ckpt_dir.glob(f"expert_{expert_name}_step_*.pt")):
+        return
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    print(f"{ts()} [s3] Syncing expert '{expert_name}' checkpoints from {S3_CHECKPOINTS_BUCKET} ...")
+    subprocess.run(
+        _s3_cmd_base() + [
+            "sync", S3_CHECKPOINTS_BUCKET, str(ckpt_dir),
+            "--exclude", "*",
+            "--include", f"expert_{expert_name}_step_*.pt",
+        ],
+        check=True,
+    )
+
+
+def inference(args: argparse.Namespace) -> None:
+    """Load expert + backbone checkpoints and run inference on a sample Porto trajectory.
+
+    Prints:
+    - Geographic routing probabilities
+    - Top-5 next-token predictions from the expert-fused AR head
+    """
+    import math
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    expert_name = args.expert or "porto"
+
+    config_data = load_config()
+    tok_cfg = config_data["tokenizer"]
+    vocab_size = tok_cfg["vocab_size"]
+    expert_config = ExpertConfig()
+
+    # ── Backbone ──────────────────────────────────────────────────────────────
+    backbone_ckpt_path = Path("data/checkpoints/ckpt_final.pt")
+    _ensure_local(backbone_ckpt_path, f"{S3_CHECKPOINTS_BUCKET}/ckpt_final.pt")
+    if not backbone_ckpt_path.exists():
+        raise FileNotFoundError(
+            f"Backbone checkpoint not found: {backbone_ckpt_path}. "
+            f"Run: make download-ckpt"
+        )
+
+    backbone = TrajectoryBackbone(
+        vocab_size=vocab_size,
+        d_model=tok_cfg["d_model"],
+        n_layers=tok_cfg["n_layers"],
+        n_heads=tok_cfg["n_heads"],
+        max_seq_len=tok_cfg["max_seq_len"],
+    ).to(device)
+    backbone_ckpt = torch.load(backbone_ckpt_path, map_location=device, weights_only=True)
+    backbone.load_state_dict(backbone_ckpt["model"])
+    backbone.eval()
+    for param in backbone.parameters():
+        param.requires_grad_(False)
+
+    # ── Expert checkpoint ─────────────────────────────────────────────────────
+    ckpt_dir = Path("data/checkpoints")
+    _ensure_expert_ckpts(expert_name, ckpt_dir)
+    expert_ckpts = sorted(ckpt_dir.glob(f"expert_{expert_name}_step_*.pt"))
+    if not expert_ckpts:
+        raise FileNotFoundError(
+            f"No expert checkpoint found for '{expert_name}' in {ckpt_dir} or S3. "
+            f"Run: python scripts/experts.py --expert {expert_name}"
+        )
+    expert_ckpt_path = expert_ckpts[-1]  # latest step
+    expert_ckpt = torch.load(expert_ckpt_path, map_location=device, weights_only=False)
+
+    # ── Road graph + expert models ────────────────────────────────────────────
+    city_graph = load_city_graph(expert_name, use_osm=False)
+    n_segments = city_graph.num_nodes() if isinstance(city_graph, MockRoadGraph) else city_graph.num_nodes
+
+    expert = GeographicExpert(
+        d_model=expert_config.d_model,
+        entity_dim=expert_config.entity_dim,
+        gat_hidden=expert_config.gat_hidden,
+        gat_heads=expert_config.gat_heads,
+        n_seg=n_segments,
+    ).to(device)
+    router = GeographicRouter(
+        d_model=expert_config.d_model,
+        n_experts=len(EXPERTS),
+        prior_strength=expert_config.prior_strength,
+    ).to(device)
+    expert.load_state_dict(expert_ckpt["expert_state_dict"])
+    router.load_state_dict(expert_ckpt["router_state_dict"])
+    expert.eval()
+    router.eval()
+
+    n_params = sum(p.numel() for p in expert.parameters()) + sum(p.numel() for p in router.parameters())
+    print(f"{ts()} [inference] Device       : {device}")
+    print(f"{ts()} [inference] Expert       : {expert_name}")
+    print(f"{ts()} [inference] Expert ckpt  : {expert_ckpt_path} (step {expert_ckpt.get('step', '?')})")
+    print(f"{ts()} [inference] Backbone     : {backbone_ckpt_path} (step {backbone_ckpt.get('step', '?')})")
+    print(f"{ts()} [inference] Road nodes   : {n_segments}  (mock={isinstance(city_graph, MockRoadGraph)})")
+    print(f"{ts()} [inference] Expert+router: {n_params / 1e6:.1f} M parameters")
+
+    # ── Sample: Boavista → Aliados, Porto, 08:00 Tuesday ─────────────────────
+    waypoints = [
+        (41.1579, -8.6291),  # Rotunda da Boavista
+        (41.1570, -8.6265),
+        (41.1558, -8.6238),
+        (41.1545, -8.6210),
+        (41.1532, -8.6183),
+        (41.1518, -8.6155),
+        (41.1504, -8.6128),
+        (41.1495, -8.6108),  # Praça da Liberdade
+    ]
+
+    try:
+        import h3 as h3lib
+        h3_res  = tok_cfg["h3_resolution"]
+        subhash = tok_cfg["subhash_vocab_size"]
+        def _latlng_to_token(lat: float, lng: float) -> int:
+            cell   = h3lib.latlng_to_cell(lat, lng, h3_res) if hasattr(h3lib, "latlng_to_cell") \
+                     else h3lib.geo_to_h3(lat, lng, h3_res)
+            h3_int = int(cell, 16)
+            return 4 + (h3_int ^ (h3_int >> 17)) % subhash
+        spatial_tokens = [_latlng_to_token(lat, lng) for lat, lng in waypoints]
+    except ImportError:
+        spatial_tokens = list(range(4, 4 + len(waypoints)))  # synthetic fallback
+
+    sample_tokens = [BOS] + spatial_tokens
+    L = len(sample_tokens)
+
+    tok     = torch.tensor([sample_tokens], dtype=torch.long, device=device)
+    dt      = torch.tensor([[0] + [4] * (L - 1)], dtype=torch.long, device=device)
+    mod     = torch.full((1, L), 480, dtype=torch.long, device=device)  # 08:00 = 480 min
+    dow     = torch.full((1, L), 1,   dtype=torch.long, device=device)  # Tuesday
+    seg_ids = torch.zeros(1, L, dtype=torch.long, device=device)
+
+    expert_idx   = EXPERTS.index(expert_name)
+    region_prior = torch.zeros(1, len(EXPERTS), device=device)
+    region_prior[:, expert_idx] = 1.0
+
+    _SPECIAL = {0: "PAD", 1: "BOS", 2: "EOS", 3: "MASK"}
+    def _label(tid: int) -> str:
+        return _SPECIAL.get(tid, f"h3:{tid}")
+
+    print(f"\n{ts()} [inference] Porto trajectory (len={L}, 08:00 Tue, dt_bucket=4)")
+    print("  route : Rotunda da Boavista → Praça da Liberdade")
+
+    with torch.no_grad():
+        # Backbone hidden states
+        h = backbone.trunk(tok, dt, mod, dow, is_causal=True)   # [1, L, d_model]
+
+        # Geographic routing
+        pooled_h = h.mean(dim=1)                                 # [1, d_model]
+        top1, route_probs, _ = router(pooled_h, region_prior)
+
+        # Road-aware fusion
+        node_emb = expert.road_context(city_graph)               # [n_nodes, gat_hidden]
+        fused_h  = expert(h, seg_ids, node_emb)                  # [1, L, d_model]
+
+        # AR next-token (weight-tied to backbone tok_emb)
+        proj     = expert.tok_head(fused_h[:, -1])               # [1, d_model]
+        logits   = (proj @ backbone.embed.tok.weight.T)[0]       # [vocab_size]
+        ar_probs = F.softmax(logits, dim=-1)
+        topk     = torch.topk(logits, 5)
+        topk_ids   = topk.indices.tolist()
+        topk_probs = ar_probs[topk.indices].tolist()
+        greedy_id  = logits.argmax().item()
+        entropy    = -(ar_probs * ar_probs.log().clamp(min=-1e9)).sum().item()
+
+    print(f"\n{ts()} [inference] Geographic routing")
+    print(f"  selected expert : {EXPERTS[top1.item()]} (idx={top1.item()})")
+    for i, name in enumerate(EXPERTS):
+        print(f"  P({name:<8}) : {route_probs[0, i].item():.4%}")
+
+    print(f"\n{ts()} [inference] AR head — expert-fused next-token prediction")
+    print(f"  input  : {[_label(t) for t in sample_tokens]}")
+    print(f"  greedy : {_label(greedy_id)} (id={greedy_id})")
+    print(f"  entropy: {entropy:.2f} nats  (max={math.log(vocab_size):.2f})")
+    print(f"  {'rank':<6} {'id':<8} {'label':<12} {'prob':>8}")
+    print(f"  {'-'*38}")
+    for rank, (tid, prob) in enumerate(zip(topk_ids, topk_probs), 1):
+        print(f"  {rank:<6} {tid:<8} {_label(tid):<12} {prob:>8.4%}")
+
+
+# ========================================================================================
 # CLI and Main
 # ========================================================================================
 
@@ -951,13 +1146,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--debug", action="store_true", help="Debug mode with minimal data")
     
     # OSM and road graph options
-    parser.add_argument("--use-osm", action="store_true", default=True, 
+    parser.add_argument("--use-osm", action="store_true", default=True,
                        help="Use real OpenStreetMap data (default: True)")
     parser.add_argument("--no-osm", dest="use_osm", action="store_false",
                        help="Disable OSM integration, use mock road graphs")
     parser.add_argument("--use-road-enhanced", action="store_true",
                        help="Load pre-computed road-enhanced gold shards from data/road_enhanced_gold/")
-    
+
+    # Inference
+    parser.add_argument("--infer", action="store_true",
+                       help="Run inference on a sample trajectory using saved checkpoints")
+
     return parser.parse_args()
 
 def main() -> None:
@@ -983,6 +1182,10 @@ def main() -> None:
         
     signal.signal(signal.SIGTERM, sigterm_handler)
     
+    if args.infer:
+        inference(args)
+        return
+
     try:
         train_expert(args)
     except KeyboardInterrupt:
