@@ -345,7 +345,7 @@ Dockerfile
 |---|---|---|
 | 1 — Backbone pretraining | **Done** | Two-headed Transformer on Porto + Beijing; AR perplexity 34,754 → 2.1 |
 | 2 — Geographic experts | **Done** | Per-city GAT adapters over OSM road graphs; Porto (ar_loss 0.61) and Beijing trained on 2×L40S via torchrun |
-| 3 — New city road graphs | Planned | Add experts for new cities (e.g. London, NYC) by running `etl.py --stage road-gold` on any OSM region and training a new `GeographicExpert` without retraining the backbone |
+| 3 — New city road graphs | Planned | Add experts for new cities (e.g. London, NYC) by running `etl.py --stage road-gold` on any OSM region and training a new `GeographicExpert` without retraining the backbone. Test [city2graph](https://github.com/c2g-dev/city2graph) |
 | 4 — Anomaly head | Planned | Perplexity scorer with threshold calibration; PR-AUC vs. GM-VSAE baseline |
 | 5 — Serving | Planned | Batch scoring endpoint; trips-per-dollar benchmark |
 
